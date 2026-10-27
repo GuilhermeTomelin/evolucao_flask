@@ -6,7 +6,8 @@ from flask import Flask, jsonify, request
 from flask_migrate import Migrate
 
 from db import db
-from models import Book
+from models import Book, Member
+from sqlalchemy.exc import IntegrityError
 
 load_dotenv()
 
@@ -140,6 +141,62 @@ def excluir_livro(book_id):
 
     return "", 204
 
+@app.get("/members")
+def listar_leitores():
+    consulta = db.select(Member).order_by(Member.name)
+    leitores = db.session.execute(consulta).scalars().all()
+
+    return jsonify([leitor.to_dict() for leitor in leitores])
+
+
+@app.post("/members")
+def cadastrar_leitor():
+    dados = request.get_json(silent=True)
+
+    if not isinstance(dados, dict):
+        return jsonify({"erro": "Envie um objeto JSON."}), 400
+
+    if set(dados) - {"name", "email"}:
+        return jsonify({"erro": "Use apenas name e email."}), 400
+
+    nome = dados.get("name")
+    email = dados.get("email")
+
+    if not isinstance(nome, str) or not nome.strip():
+        return jsonify({"erro": "Informe o nome do leitor."}), 400
+
+    if not isinstance(email, str):
+        return jsonify({"erro": "Informe um e-mail."}), 400
+
+    nome = nome.strip()
+    email = email.strip().lower()
+
+    if len(nome) > 150:
+        return jsonify({"erro": "O nome deve ter até 150 caracteres."}), 400
+
+    # Verificação básica de formato para este projeto de estudos.
+    partes = email.split("@")
+
+    if (
+        len(email) > 200
+        or len(partes) != 2
+        or not partes[0]
+        or not partes[1]
+        or any(caractere.isspace() for caractere in email)
+    ):
+        return jsonify({"erro": "Informe um e-mail válido."}), 400
+
+    leitor = Member(name=nome, email=email)
+
+    db.session.add(leitor)
+
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"erro": "Este e-mail já está cadastrado."}), 409
+
+    return jsonify(leitor.to_dict()), 201
 
 if __name__ == "__main__":
     app.run()
