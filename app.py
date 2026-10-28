@@ -6,13 +6,16 @@ import click
 from dotenv import load_dotenv
 from flask import Flask, g, jsonify, request, session
 from flask_migrate import Migrate
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from db import db
 from models import Book, Member, User
+from circulation import register_circulation
+from accounts import register_accounts
 
 
-load_dotenv()
+if os.getenv("FLASK_SKIP_DOTENV") != "1":
+    load_dotenv()
 
 
 app = Flask(__name__)
@@ -34,9 +37,11 @@ app.config["SQLALCHEMY_DATABASE_URI"] = (
     os.getenv("DATABASE_URL") or "sqlite:///books.db"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"hide_parameters": True}
 
 db.init_app(app)
 migrate = Migrate(app, db)
+register_circulation(app)
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +68,9 @@ def email_valido(email):
         or not partes[1]
         or any(caractere.isspace() for caractere in email)
     )
+
+
+register_accounts(app, email_valido)
 
 
 def validar_dados():
@@ -112,8 +120,8 @@ def validar_dados():
 
 @app.before_request
 def verificar_acesso():
-    # Estas duas rotas podem ser acessadas sem login.
-    if request.endpoint in {"inicio", "login"}:
+    # Somente estas rotas são públicas.
+    if request.endpoint in {"inicio", "login", "solicitar_cadastro"}:
         return None
 
     # Rota inexistente: deixa o Flask devolver o 404.
@@ -133,23 +141,40 @@ def verificar_acesso():
 
     usuario = db.session.get(User, identificador)
 
-    if usuario is None or not usuario.active:
+    if usuario is None or not usuario.active or usuario.status != "approved":
         session.clear()
         return jsonify({"erro": "Conta indisponível."}), 401
 
+    # Cookies anteriores à etapa A usam versão 0 e continuam válidos.
+    if session.get("auth_version", 0) != usuario.auth_version:
+        session.clear()
+        return jsonify({"erro": "Seu acesso foi alterado. Faça login novamente."}), 401
+
     g.usuario = usuario
 
-    # Leitores podem consultar os livros.
-    # Operações de cadastro/edição e acesso aos leitores exigem administrador.
-    consulta_catalogo = (
-        request.endpoint in {"listar_livros", "consultar_livro"}
-        and request.method == "GET"
-    )
+    # Lista explícita: rotas novas não recebem permissão por acidente.
+    reader_routes = {
+        "minha_conta": {"GET", "HEAD"}, "logout": {"POST"},
+        "listar_livros": {"GET", "HEAD"}, "consultar_livro": {"GET", "HEAD"},
+        "emprestar": {"POST"}, "listar_emprestimos": {"GET", "HEAD"},
+        "consultar_emprestimo": {"GET", "HEAD"}, "devolver": {"POST"},
+    }
+    admin_routes = {
+        "cadastrar_livro": {"POST"}, "atualizar_livro": {"PUT"},
+        "excluir_livro": {"DELETE"}, "listar_leitores": {"GET", "HEAD"},
+        "cadastrar_leitor": {"POST"}, "listar_contas": {"GET", "HEAD"},
+        "associar_leitor": {"PUT"}, "listar_exemplares": {"GET", "HEAD"},
+        "cadastrar_exemplar": {"POST"},
+        "aprovar_conta": {"POST"}, "rejeitar_conta": {"POST"},
+        "bloquear_conta": {"POST"}, "atribuir_papel": {"PUT"},
+    }
+    staff_routes = {"listar_exemplares": {"GET", "HEAD"}}
+    staff_allowed = request.method in staff_routes.get(request.endpoint, set())
+    allowed = request.method in reader_routes.get(request.endpoint, set())
+    admin_allowed = request.method in admin_routes.get(request.endpoint, set())
+    if not allowed and not (usuario.role == "admin" and admin_allowed) and not (usuario.can_manage_loans and staff_allowed):
+        return jsonify({"erro": "Acesso exclusivo do administrador ou operação não permitida."}), 403
 
-    acesso_conta = request.endpoint in {"minha_conta", "logout"}
-
-    if not consulta_catalogo and not acesso_conta and not usuario.is_admin:
-        return jsonify({"erro": "Acesso exclusivo do administrador."}), 403
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +251,11 @@ def excluir_livro(book_id):
         return jsonify({"erro": "Livro não encontrado."}), 404
 
     db.session.delete(livro)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"erro": "Livro possui exemplares. A exclusão foi bloqueada para preservar os vínculos e o histórico."}), 409
 
     return "", 204
 
@@ -302,6 +331,7 @@ def login():
         return jsonify({"erro": "Informe email e password."}), 400
 
     email = email.strip().lower()
+    session.clear()
 
     usuario = db.session.execute(
         db.select(User).where(User.email == email)
@@ -309,13 +339,23 @@ def login():
 
     if (
         usuario is None
-        or not usuario.active
         or not usuario.check_password(senha)
     ):
         return jsonify({"erro": "E-mail ou senha inválidos."}), 401
 
+    if usuario.status != "approved":
+        messages = {
+            "pending": "Cadastro pendente. Aguarde a aprovação do administrador.",
+            "rejected": "Cadastro rejeitado. Procure o administrador.",
+            "blocked": "Conta bloqueada. Procure o administrador.",
+        }
+        return jsonify(erro=messages.get(usuario.status, "Conta indisponível.")), 403
+    if not usuario.active:
+        return jsonify(erro="Conta indisponível. Procure o administrador."), 401
+
     session.clear()
     session["user_id"] = str(usuario.id)
+    session["auth_version"] = usuario.auth_version
     session.permanent = True
 
     return jsonify({
@@ -347,6 +387,15 @@ def erro_404(_erro):
 @app.errorhandler(405)
 def erro_405(_erro):
     return jsonify({"erro": "Método não permitido nesta rota."}), 405
+
+
+@app.errorhandler(OperationalError)
+def erro_banco_ocupado(erro):
+    db.session.rollback()
+    if "locked" in str(erro.orig).lower() or "busy" in str(erro.orig).lower():
+        return jsonify({"erro": "Banco ocupado por outra operação. Atualize a página e tente novamente."}), 409
+    app.logger.error("Falha operacional do banco; confira a configuração e as migrações.")
+    return jsonify({"erro": "Banco indisponível. Peça ao administrador para verificar as migrações."}), 503
 
 
 @app.errorhandler(500)

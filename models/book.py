@@ -18,9 +18,19 @@ class Book(db.Model):
     description = db.Column(Text, nullable=False, default="")
 
     def to_dict(self):
+        from .copy import Copy
+        from .loan import Loan
+        active = db.select(Loan.id).where(
+            Loan.copy_id == Copy.id, Loan.returned_at.is_(None)).exists()
+        total = db.session.scalar(db.select(db.func.count()).select_from(Copy).where(
+            Copy.book_id == self.id))
+        available = db.session.scalar(db.select(db.func.count()).select_from(Copy).where(
+            Copy.book_id == self.id, ~active))
         return {
             "id": str(self.id),
             "title": self.title,
             "author": self.author,
-            "description": self.description
+            "description": self.description,
+            "total_copies": total,
+            "available_copies": available
         }
